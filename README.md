@@ -26,6 +26,10 @@ Override with `YTDLP_FORMAT`:
   ```
 - `cookies.txt` in Netscape format (export from a browser extension). Optional — the bot runs
   without it, but YouTube may reject requests. Storyboards usually work without cookies.
+  **Cookies rotate** — if the bot reports "cookies are no longer valid", re-export fresh ones.
+- A JavaScript runtime for yt-dlp's n-challenge (needed to expose real video formats):
+  `brew install deno` (or `apt install deno`). Without it YouTube often serves **only
+  storyboards**, so `YTDLP_FORMAT=medium` will fall back to a storyboard.
 - A bot token from [@BotFather](https://t.me/BotFather).
 
 ## Setup
