@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
-"""Telegram bot that downloads a YouTube storyboard with yt-dlp and returns it as mp4.
+"""Telegram bot that downloads a YouTube video with yt-dlp and returns an mp4.
 
 Flow:
   1. User sends a YouTube link.
-  2. `yt-dlp -f sb0 --write-info-json --cookies cookies.txt -o videos/<id>.<ext> <link>`
-     downloads the storyboard, which yt-dlp saves as a `.mhtml` file: a MIME archive that
-     embeds each storyboard sprite-sheet whole (one image per fragment).
-  3. ffmpeg cannot read .mhtml, so we pull the sprite-sheets out of the archive, split each
-     into its grid of thumbnail frames, and assemble the frames into an mp4 with ffmpeg.
-     The tile grid is read from the format metadata in the .info.json (the .mhtml itself
-     carries no geometry). If that metadata is unavailable we fall back to using each whole
-     sprite-sheet as a single frame.
-  4. The mp4 is sent back to the chat.
-
-Format selection: by default (YTDLP_FORMAT=medium) the bot first lists the available formats
-(`yt-dlp -J`) and downloads the *medium* one — the median of the distinct video heights the
-video actually offers — merged to mp4. Set YTDLP_FORMAT to any yt-dlp `-f` value to override,
-e.g. `best` for the top quality or `sb0` for the storyboard.
-
-Note: `sb0` is the *storyboard* (a slideshow of tiny scrubber thumbnails), saved as `.mhtml`;
-only that path runs the mhtml->mp4 conversion below. Any real video format is already playable
-and is sent as-is.
+  2. resolve_format() decides what to grab:
+       - FORMAT="medium" (default): list formats with `yt-dlp -J`, pick the median of the
+         distinct video heights the video actually offers, and download that tier merged to
+         mp4. If the video exposes no real video formats (e.g. YouTube served storyboards
+         only), fall back to the `sb0` storyboard.
+       - any other FORMAT (e.g. "best", "sb0"): passed straight to yt-dlp.
+  3. download() runs `yt-dlp -f <selector> --write-info-json --merge-output-format mp4 ...`.
+  4. Output handling:
+       - real video (.mp4): sent as-is.
+       - storyboard (.mhtml): a MIME archive of sprite-sheets. ffmpeg can't read it, so we
+         extract the sheets, split each into its grid of thumbnails (grid geometry read from
+         the .info.json — the .mhtml carries none), and assemble the frames into an mp4.
+         If the grid can't be determined, each whole sheet becomes one frame.
 
 Config via environment variables:
   BOT_TOKEN        (required) Telegram bot token from @BotFather
-  YTDLP_PATH       yt-dlp binary            (default: ./yt-dlp)
-  COOKIES_PATH     cookies file             (default: cookies.txt; skipped if missing)
-  YTDLP_FORMAT     "medium" | any -f value  (default: medium; e.g. best, sb0)
-  VIDEOS_DIR       download dir             (default: videos)
-  STORYBOARD_FPS   frames/sec for slideshow (default: 4)
+  YTDLP_PATH       yt-dlp binary                (default: ./yt-dlp)
+  COOKIES_PATH     cookies file                 (default: cookies.txt; skipped if missing)
+  YTDLP_FORMAT     "medium" or any yt-dlp -f     (default: medium)
+  VIDEOS_DIR       download dir                 (default: videos)
+  STORYBOARD_FPS   frames/sec for storyboards   (default: 4)
 """
 from __future__ import annotations
 
@@ -73,25 +68,25 @@ YT_RE = re.compile(
 
 
 # --------------------------------------------------------------------------- #
-# subprocess helper                                                           #
+# subprocess helpers                                                          #
 # --------------------------------------------------------------------------- #
 async def run(*cmd: str) -> tuple[int, str]:
-    """Run a command, capturing merged stdout/stderr as text."""
+    """Run a command, merging stderr into stdout (good for user-facing error text)."""
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors="replace")
 
 
 async def run_out(*cmd: str) -> tuple[int, str, str]:
-    """Run a command, capturing stdout and stderr separately (keeps stdout clean for JSON)."""
+    """Run a command, keeping stdout and stderr separate.
+
+    Essential for `yt-dlp -J`: yt-dlp prints warnings/progress to stderr and the JSON to
+    stdout, so merging the streams would corrupt the JSON.
+    """
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     out, err = await proc.communicate()
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
@@ -101,17 +96,20 @@ def _tail(text: str, n: int = 1500) -> str:
     return text[-n:]
 
 
+_cookies_warned = False
+
+
 def cookie_args() -> list[str]:
     if Path(COOKIES).exists():
         return ["--cookies", COOKIES]
-    log.warning("cookies file %r missing; continuing without it", COOKIES)
+    global _cookies_warned
+    if not _cookies_warned:
+        log.warning("cookies file %r missing; continuing without it", COOKIES)
+        _cookies_warned = True
     return []
 
 
-# --------------------------------------------------------------------------- #
-# download                                                                    #
-# --------------------------------------------------------------------------- #
-def _ensure_ytdlp() -> None:
+def ensure_ytdlp() -> None:
     if shutil.which(YTDLP) is None and not Path(YTDLP).exists():
         raise RuntimeError(
             f"yt-dlp not found at {YTDLP!r}. Put the binary in the repo "
@@ -120,74 +118,73 @@ def _ensure_ytdlp() -> None:
         )
 
 
-def pick_medium_height(formats: list[dict]) -> tuple[int | None, list[int]]:
-    """Median of the distinct video heights on offer — the 'medium' available quality.
-
-    Returns (chosen_height, all_distinct_heights). chosen_height is None when the video
-    exposes no video-bearing formats (audio-only, or an empty/odd format list).
-    """
-    heights = sorted(
+# --------------------------------------------------------------------------- #
+# format resolution                                                           #
+# --------------------------------------------------------------------------- #
+def _video_heights(formats: list[dict]) -> list[int]:
+    """Distinct, sorted heights of real (non-storyboard, non-audio) video formats."""
+    return sorted(
         {
             int(f["height"])
             for f in formats
             if f.get("height") and f.get("vcodec") not in (None, "none")
         }
     )
-    if not heights:
-        return None, []
-    # median; for an even count take the upper-middle so "medium" leans to the better quality
-    return heights[len(heights) // 2], heights
 
 
-async def resolve_format(url: str) -> tuple[str, str | None]:
-    """Turn the configured FORMAT into a concrete yt-dlp selector plus a human summary.
+def pick_medium_height(formats: list[dict]) -> int | None:
+    """Median distinct video height; upper-middle on ties (biases to better quality).
 
-    FORMAT == "medium": list the available formats (`yt-dlp -J`) and pick the median video
-    height. Any other value is passed straight through to yt-dlp unchanged.
+    e.g. 144/240/360/480/720/1080 -> 480; 360/720/1080 -> 720. None if no video formats.
     """
-    if FORMAT != "medium":
-        return FORMAT, None
+    heights = _video_heights(formats)
+    return heights[len(heights) // 2] if heights else None
 
-    _ensure_ytdlp()
+
+def select_medium(formats: list[dict]) -> tuple[str, str]:
+    """(yt-dlp -f selector, human summary) for the medium tier, or a storyboard fallback."""
+    heights = _video_heights(formats)
+    if not heights:
+        return "sb0", "sb0 (no video formats offered — storyboard only)"
+    h = heights[len(heights) // 2]
+    selector = f"bv*[height<={h}]+ba/b[height<={h}]/b"
+    return selector, f"medium {h}p (of {'/'.join(map(str, heights))})"
+
+
+async def resolve_format(url: str) -> tuple[str, str]:
+    """Resolve FORMAT into a concrete (selector, summary)."""
+    if FORMAT != "medium":
+        return FORMAT, FORMAT
     code, out, err = await run_out(YTDLP, "-J", "--no-playlist", *cookie_args(), url)
     if code != 0:
-        raise RuntimeError(f"yt-dlp format listing failed (exit {code}):\n{_tail(err or out)}")
+        raise RuntimeError(f"yt-dlp -J failed (exit {code}):\n{_tail(err)}")
     try:
         formats = json.loads(out).get("formats", [])
     except ValueError as exc:
-        raise RuntimeError(f"could not parse yt-dlp format list: {exc}")
-
-    med, heights = pick_medium_height(formats)
-    if med is None:
-        return "best", "no video formats listed; using best"
-    summary = f"available: {', '.join(f'{h}p' for h in heights)} — picking {med}p (medium)"
-    log.info(summary)
-    # best video at or below the medium height + best audio, merged; fall back to any format
-    return f"bv*[height<={med}]+ba/b[height<={med}]/b", summary
+        raise RuntimeError(f"could not parse yt-dlp JSON: {exc}")
+    return select_medium(formats)
 
 
+# --------------------------------------------------------------------------- #
+# download                                                                    #
+# --------------------------------------------------------------------------- #
 async def download(url: str, vid: str, selector: str) -> tuple[Path, Path | None]:
-    """Run yt-dlp with the given format selector; return (media_file, info_json | None).
+    """Run yt-dlp; return (media_file, info_json | None).
 
-    media_file is the .mhtml for storyboards, or the (mp4) media file for real formats.
+    media_file is a real .mp4, or the .mhtml for storyboard selectors.
     """
-    _ensure_ytdlp()
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(VIDEOS_DIR / "%(id)s.%(ext)s")
-
-    cmd = [
+    code, out = await run(
         YTDLP, "-f", selector,
-        "--no-playlist", "--write-info-json",
-        "--merge-output-format", "mp4",
+        "--no-playlist", "--write-info-json", "--merge-output-format", "mp4",
         "-o", out_tmpl, *cookie_args(), url,
-    ]
-    code, out = await run(*cmd)
+    )
     if code != 0:
         raise RuntimeError(f"yt-dlp failed (exit {code}):\n{_tail(out)}")
 
     info = VIDEOS_DIR / f"{vid}.info.json"
     info = info if info.exists() else None
-
     media = [
         p
         for p in sorted(VIDEOS_DIR.glob(f"{vid}.*"), key=lambda p: p.stat().st_mtime)
@@ -294,26 +291,12 @@ async def frames_to_mp4(workdir: Path, out: Path) -> None:
 # telegram handlers                                                           #
 # --------------------------------------------------------------------------- #
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    allowed = os.environ.get("USER")
-    if allowed and user.username != allowed:
-        await update.message.reply_text(
-            f"Sorry, @{user.username}, this bot is private. "
-        )
-        return
     await update.message.reply_text(
-        "Send me a YouTube link and I'll return the storyboard as an mp4."
+        "Send me a YouTube link and I'll download it and send back an mp4."
     )
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed = os.environ.get("USER")
-    user = update.effective_user
-    if allowed and user.username != allowed:
-        await update.message.reply_text(
-            f"Sorry, @{user.username}, this bot is private. "
-        )
-        return
     match = YT_RE.search(update.message.text or "")
     if not match:
         await update.message.reply_text("That doesn't look like a YouTube link.")
@@ -321,21 +304,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     url, vid = match.group(0), match.group(1)
     status = await update.message.reply_text("Checking formats…")
-    workdir = Path(tempfile.mkdtemp(prefix="sb_"))
+    workdir = Path(tempfile.mkdtemp(prefix="yt_"))
     try:
+        ensure_ytdlp()
         selector, summary = await resolve_format(url)
-        await status.edit_text(f"{summary}\nDownloading…" if summary else "Downloading…")
+        await status.edit_text(f"Downloading ({summary})…")
         media, info = await download(url, vid, selector)
 
         if media.suffix.lower() == ".mhtml":
             await status.edit_text("Converting storyboard to mp4…")
-            n = await asyncio.to_thread(build_frames, media, workdir, info, FORMAT)
+            n = await asyncio.to_thread(build_frames, media, workdir, info, selector)
             out = workdir / f"{vid}.mp4"
             await frames_to_mp4(workdir, out)
-            caption = f"{vid} — {n} storyboard frames @ {FPS:g}fps"
+            caption = f"{vid} — {summary}, {n} frames @ {FPS:g}fps"
         else:
-            out = media  # already a playable media file (e.g. real video)
-            caption = f"{vid}\n{summary}" if summary else vid
+            out = media  # already a playable mp4
+            caption = f"{vid} — {summary}"
 
         size = out.stat().st_size
         if size > 50 * 1024 * 1024:
