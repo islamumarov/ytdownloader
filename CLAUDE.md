@@ -16,8 +16,7 @@ Bot requires **runtime binaries**, not pip packages:
 - `yt-dlp` binary in repo root. Download from https://github.com/yt-dlp/yt-dlp/releases, `chmod +x yt-dlp`.
 - `ffmpeg` on `PATH` (`brew install ffmpeg`).
 - `.env` with `BOT_TOKEN` (get from [@BotFather](https://t.me/BotFather)).
-- `cookies.txt` (optional, Netscape format) — YouTube may reject requests without it, but `-f sb0` usually works. Cookies rotate and expire; refresh when yt-dlp warns they're invalid.
-- **JS runtime (deno)** for yt-dlp's n-challenge. Without it (or with stale cookies), YouTube's bot-check strips real video formats and serves **only storyboards** — then `medium` falls back to a storyboard. This is why `resolve_format` is best-effort.
+- `cookies.txt` (optional, Netscape format) — YouTube may reject requests without it, but `-f sb0` usually works.
 
 ## Architecture
 
@@ -27,10 +26,10 @@ Telegram message → extract YouTube URL → resolve format → download → han
 
 User sends YT link. Bot needs to decide what to download (`-f` selector for yt-dlp).
 
-- **`FORMAT="medium"` (default):** List available formats (`yt-dlp -J`), pick a medium one via `pick_medium()`.
-  - Prefers real video: median of distinct video heights. 144/240/360/480/720/1080p → 480p; 360/720/1080p → 720p.
-  - **Storyboard fallback:** if no real video formats exist (bot-check/stale cookies often leave only storyboards), picks the median-resolution storyboard (`sb0..sb3`), which then flows through the mhtml→mp4 pipeline.
-  - `-J` is best-effort: it needs the full player response, which YouTube's bot-check can deny even when a plain `-f sb0` still works. On listing failure, `resolve_format` falls back to `sb0` (with `_hint()` tips) instead of aborting.
+- **`FORMAT="medium"` (default):** List available formats (`yt-dlp -J`), pick median of the distinct video heights.
+  - Examples: 144/240/360/480/720/1080p → 480p; 360/720/1080p → 720p.
+  - Rationale: yields reasonable quality without massive files; adaptive to each video's encoding ladder.
+  - Implemented in `pick_medium_height()` (filters audio-only, handles deduplication).
 
 - **`FORMAT="best"` or any other `-f` selector:** Pass directly to yt-dlp.
 
@@ -100,8 +99,7 @@ Builds synthetic MHTML + .info.json, exercises extract/split/assemble, verifies 
 
 | Task | Location |
 |---|---|
-| Format picking (video + storyboard fallback) | `pick_medium()` |
-| Error → actionable tips | `_hint()` |
+| Format picking | `pick_medium_height()` |
 | Format resolution | `resolve_format()` |
 | Download | `download()` |
 | Extract MIME | `extract_images()` |

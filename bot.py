@@ -101,19 +101,6 @@ def _tail(text: str, n: int = 1500) -> str:
     return text[-n:]
 
 
-def _hint(err: str) -> str:
-    """Turn common yt-dlp failure signatures into actionable one-line tips for the reply."""
-    e = (err or "").lower()
-    tips = []
-    if "cookies" in e and ("no longer valid" in e or "rotated" in e or "expired" in e):
-        tips.append("cookies.txt is expired — re-export fresh YouTube cookies")
-    if "not a bot" in e or "sign in to confirm" in e:
-        tips.append("bot check — refresh cookies and/or use a residential IP")
-    if "javascript runtime" in e or "js runtime" in e:
-        tips.append("install a JS runtime (deno) for the n-challenge, or pass --js-runtimes")
-    return ("\nhints: " + "; ".join(tips)) if tips else ""
-
-
 def cookie_args() -> list[str]:
     if Path(COOKIES).exists():
         return ["--cookies", COOKIES]
@@ -133,21 +120,11 @@ def _ensure_ytdlp() -> None:
         )
 
 
-def _area(f: dict) -> int:
-    return int(f.get("width") or 0) * int(f.get("height") or 0)
+def pick_medium_height(formats: list[dict]) -> tuple[int | None, list[int]]:
+    """Median of the distinct video heights on offer — the 'medium' available quality.
 
-
-def _is_storyboard(f: dict) -> bool:
-    return f.get("ext") == "mhtml" or f.get("format_note") == "storyboard"
-
-
-def pick_medium(formats: list[dict]) -> tuple[str, str]:
-    """Pick a medium-quality format from what yt-dlp actually lists.
-
-    Prefers real video: the median of the distinct video heights, downloaded with audio and
-    merged to mp4. When YouTube exposes no real video (bot-check / stale cookies often leave
-    only storyboards), falls back to the median-resolution storyboard, which then flows
-    through the mhtml->mp4 pipeline. Returns (yt-dlp selector, human summary).
+    Returns (chosen_height, all_distinct_heights). chosen_height is None when the video
+    exposes no video-bearing formats (audio-only, or an empty/odd format list).
     """
     heights = sorted(
         {
@@ -156,59 +133,37 @@ def pick_medium(formats: list[dict]) -> tuple[str, str]:
             if f.get("height") and f.get("vcodec") not in (None, "none")
         }
     )
-    if heights:
-        # median; even count -> upper-middle, so "medium" leans to the better quality
-        med = heights[len(heights) // 2]
-        listing = ", ".join(f"{h}p" for h in heights)
-        return (
-            f"bv*[height<={med}]+ba/b[height<={med}]/b",
-            f"video: {listing} — picking {med}p (medium)",
-        )
-
-    storyboards = sorted(
-        (f for f in formats if _is_storyboard(f) and f.get("width") and f.get("height")),
-        key=_area,
-    )
-    if storyboards:
-        pick = storyboards[len(storyboards) // 2]
-        listing = ", ".join(f'{f["format_id"]} {f["width"]}x{f["height"]}' for f in storyboards)
-        return (
-            pick["format_id"],
-            f"no real video available — storyboards: {listing}; "
-            f"picking {pick['format_id']} ({pick['width']}x{pick['height']})",
-        )
-
-    return "best", "no listable formats — trying best"
+    if not heights:
+        return None, []
+    # median; for an even count take the upper-middle so "medium" leans to the better quality
+    return heights[len(heights) // 2], heights
 
 
 async def resolve_format(url: str) -> tuple[str, str | None]:
     """Turn the configured FORMAT into a concrete yt-dlp selector plus a human summary.
 
-    FORMAT == "medium": list the available formats (`yt-dlp -J`) and pick a medium one via
-    pick_medium(). Any other value is passed straight through to yt-dlp unchanged.
-
-    Listing is best-effort: `-J` needs the full player response, which YouTube's bot-check
-    can deny even when a plain `-f sb0` download still succeeds. So on a listing failure we
-    fall back to the storyboard rather than aborting the whole request.
+    FORMAT == "medium": list the available formats (`yt-dlp -J`) and pick the median video
+    height. Any other value is passed straight through to yt-dlp unchanged.
     """
     if FORMAT != "medium":
         return FORMAT, None
 
     _ensure_ytdlp()
     code, out, err = await run_out(YTDLP, "-J", "--no-playlist", *cookie_args(), url)
-    if code == 0:
-        try:
-            formats = json.loads(out).get("formats", [])
-        except ValueError:
-            formats = []
-        if formats:
-            selector, summary = pick_medium(formats)
-            log.info(summary)
-            return selector, summary
+    if code != 0:
+        raise RuntimeError(f"yt-dlp format listing failed (exit {code}):\n{_tail(err or out)}")
+    try:
+        formats = json.loads(out).get("formats", [])
+    except ValueError as exc:
+        raise RuntimeError(f"could not parse yt-dlp format list: {exc}")
 
-    reason = " ".join(_tail(err or out, 300).split()) or f"exit {code}"
-    log.warning("format listing failed (%s); falling back to sb0", reason)
-    return "sb0", f"format listing failed, using storyboard sb0{_hint(err or out)}"
+    med, heights = pick_medium_height(formats)
+    if med is None:
+        return "best", "no video formats listed; using best"
+    summary = f"available: {', '.join(f'{h}p' for h in heights)} — picking {med}p (medium)"
+    log.info(summary)
+    # best video at or below the medium height + best audio, merged; fall back to any format
+    return f"bv*[height<={med}]+ba/b[height<={med}]/b", summary
 
 
 async def download(url: str, vid: str, selector: str) -> tuple[Path, Path | None]:
@@ -228,7 +183,7 @@ async def download(url: str, vid: str, selector: str) -> tuple[Path, Path | None
     ]
     code, out = await run(*cmd)
     if code != 0:
-        raise RuntimeError(f"yt-dlp failed (exit {code}):\n{_tail(out)}{_hint(out)}")
+        raise RuntimeError(f"yt-dlp failed (exit {code}):\n{_tail(out)}")
 
     info = VIDEOS_DIR / f"{vid}.info.json"
     info = info if info.exists() else None
@@ -267,14 +222,11 @@ def tile_size(info: Path | None, fmt: str, sheet_size: tuple[int, int]) -> tuple
     if info is None:
         return None
     try:
-        data = json.loads(info.read_text())
+        formats = json.loads(info.read_text()).get("formats", [])
     except (OSError, ValueError) as exc:
         log.warning("could not read %s: %s", info, exc)
         return None
-    formats = data.get("formats", [])
-    # prefer the format actually downloaded (info.json records it), fall back to the request
-    fmt_id = data.get("format_id") or fmt
-    meta = next((f for f in formats if f.get("format_id") == fmt_id), None)
+    meta = next((f for f in formats if f.get("format_id") == fmt), None)
     if not meta:
         return None
     tw, th = meta.get("width"), meta.get("height")
